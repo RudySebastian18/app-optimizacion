@@ -2,8 +2,20 @@ use std::sync::Mutex;
 use sysinfo::System;
 use tauri::Emitter;
 
+use std::collections::{HashMap, VecDeque};
+
+const MAX_HISTORY_SAMPLES: usize = 30;
+const MIN_SAMPLES_FOR_BASELINE: usize = 5;
+
+#[derive(Default)]
+struct ProcessHistory {
+    cpu_samples: VecDeque<f32>,
+    mem_samples: VecDeque<u64>,
+}
+
 struct AppState {
     sys: Mutex<System>,
+    history: Mutex<HashMap<String, ProcessHistory>>,
 }
 
 #[tauri::command]
@@ -323,7 +335,7 @@ const DISABLED_KEY_PATH: &str = r"Software\AppOptimizacion\DisabledStartup";
 struct StartupProgram {
     name: String,
     command: String,
-    location: String, // "HKCU" o "HKLM"
+    location: String,
     enabled: bool,
 }
 
@@ -493,7 +505,6 @@ fn clean_dir_contents(path: &Path) -> CleanResult {
                 freed += sub_result.freed_mb;
                 deleted += sub_result.deleted_count;
                 skipped += sub_result.skipped_count;
-                // Intenta borrar la carpeta ya vacía; si falla (ej. sigue en uso), simplemente la deja.
                 let _ = fs::remove_dir(&entry_path);
             } else if let Ok(meta) = entry.metadata() {
                 let size = meta.len();
@@ -503,7 +514,6 @@ fn clean_dir_contents(path: &Path) -> CleanResult {
                         deleted += 1;
                     }
                     Err(_) => {
-                        // Archivo en uso por otro programa — se omite, no es un error fatal.
                         skipped += 1;
                     }
                 }
@@ -533,11 +543,248 @@ fn clean_temp_category(path: String) -> Result<CleanResult, String> {
     Ok(clean_dir_contents(target))
 }
 
+// ---- Analizador de espacio en disco ----
+
+#[derive(Clone, serde::Serialize)]
+struct FolderEntry {
+    name: String,
+    path: String,
+    size_mb: u64,
+    is_dir: bool,
+}
+
+const SKIP_ENTRIES: &[&str] = &[
+    "system volume information",
+    "$recycle.bin",
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+    "recovery",
+];
+
+fn should_skip(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    if SKIP_ENTRIES.contains(&name.as_str()) {
+        return true;
+    }
+
+    // Evita seguir junctions/symlinks: es la causa más común de recursión infinita en Windows.
+    match fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_symlink(),
+        Err(_) => true, // si no se puede leer, mejor omitir que arriesgarse
+    }
+}
+
+use jwalk::WalkDir;
+
+fn calc_dir_size(path: &Path) -> u64 {
+    WalkDir::new(path)
+        .skip_hidden(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| !should_skip(&entry.path()))
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.metadata().map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
+#[tauri::command]
+fn get_drives() -> Vec<String> {
+    let mut drives = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        if Path::new(&drive).exists() {
+            drives.push(drive);
+        }
+    }
+    drives
+}
+use rayon::prelude::*;
+
+#[tauri::command]
+async fn get_folder_sizes(path: String) -> Result<Vec<FolderEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = Path::new(&path);
+        if !base.exists() {
+            return Err("La ruta no existe.".into());
+        }
+
+        let read = fs::read_dir(base).map_err(|e| format!("No se pudo leer la carpeta ({e})"))?;
+
+        let raw_entries: Vec<(String, std::path::PathBuf, bool)> = read
+            .filter_map(|e| e.ok())
+            .map(|entry| {
+                let p = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = p.is_dir();
+                (name, p, is_dir)
+            })
+            .filter(|(_, p, _)| !should_skip(p))
+            .collect();
+
+        // Cada carpeta se calcula en un hilo distinto, aprovechando todos los núcleos.
+        let mut entries: Vec<FolderEntry> = raw_entries
+            .par_iter()
+            .map(|(name, p, is_dir)| {
+                let size = if *is_dir {
+                    calc_dir_size(p)
+                } else {
+                    fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                };
+
+                FolderEntry {
+                    name: name.clone(),
+                    path: p.to_string_lossy().to_string(),
+                    size_mb: size / 1024 / 1024,
+                    is_dir: *is_dir,
+                }
+            })
+            .collect();
+
+        entries.sort_by(|a, b| b.size_mb.cmp(&a.size_mb));
+        Ok(entries)
+    })
+    .await
+    .map_err(|e| format!("Error interno: {e}"))?
+}
+
+fn mean_and_stddev(samples: &VecDeque<f32>) -> (f64, f64) {
+    let n = samples.len() as f64;
+    if n == 0.0 {
+        return (0.0, 0.0);
+    }
+    let mean: f64 = samples.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let variance: f64 = samples.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    (mean, variance.sqrt())
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AnomalyAlert {
+    process_name: String,
+    metric: String, // "ram" o "cpu"
+    current_value: f64,
+    baseline_avg: f64,
+    severity: String, // "warning" o "critical"
+    message: String,
+}
+
+#[tauri::command]
+fn get_anomalies(state: tauri::State<AppState>) -> Vec<AnomalyAlert> {
+    let mut sys = state.sys.lock().unwrap();
+    sys.refresh_all();
+
+    // Agrupa por nombre de proceso (puede haber varias instancias, ej. varios "chrome.exe")
+    let mut aggregated: HashMap<String, (f32, u64)> = HashMap::new();
+    for (_, process) in sys.processes() {
+        let name = process.name().to_string_lossy().to_string();
+        let entry = aggregated.entry(name).or_insert((0.0, 0));
+        entry.0 += process.cpu_usage();
+        entry.1 += process.memory() / 1024 / 1024;
+    }
+
+    let mut history = state.history.lock().unwrap();
+    let mut alerts = Vec::new();
+
+    for (name, (cpu, mem_mb)) in aggregated.iter() {
+        let record = history.entry(name.clone()).or_default();
+
+        // Compara contra el historial ANTES de agregar la muestra actual.
+        if record.cpu_samples.len() >= MIN_SAMPLES_FOR_BASELINE {
+            let (cpu_mean, cpu_std) = mean_and_stddev(&record.cpu_samples);
+            let (mem_mean, _mem_std) = {
+                let float_samples: VecDeque<f32> =
+                    record.mem_samples.iter().map(|&v| v as f32).collect();
+                mean_and_stddev(&float_samples)
+            };
+
+            // RAM: solo alerta si el salto es grande Y relevante en términos absolutos (evita ruido en procesos que usan pocos MB)
+            if mem_mean > 20.0 && (*mem_mb as f64) > mem_mean * 1.6 {
+                let severity = if (*mem_mb as f64) > mem_mean * 2.5 { "critical" } else { "warning" };
+                alerts.push(AnomalyAlert {
+                    process_name: name.clone(),
+                    metric: "ram".into(),
+                    current_value: *mem_mb as f64,
+                    baseline_avg: mem_mean,
+                    severity: severity.into(),
+                    message: format!(
+                        "\"{}\" está usando {} MB de RAM, muy por encima de su promedio habitual (~{:.0} MB).",
+                        name, mem_mb, mem_mean
+                    ),
+                });
+            }
+
+            // CPU: umbral absoluto también (evita marcar saltos de 0.1% a 0.3% como "anomalía")
+            if cpu_mean > 3.0 && (*cpu as f64) > cpu_mean as f64 + (cpu_std as f64 * 2.0).max(cpu_mean as f64 * 0.6) {
+                let severity = if (*cpu as f64) > cpu_mean as f64 * 2.5 { "critical" } else { "warning" };
+                alerts.push(AnomalyAlert {
+                    process_name: name.clone(),
+                    metric: "cpu".into(),
+                    current_value: *cpu as f64,
+                    baseline_avg: cpu_mean as f64,
+                    severity: severity.into(),
+                    message: format!(
+                        "\"{}\" está usando {:.1}% de CPU, muy por encima de su promedio habitual (~{:.1}%).",
+                        name, cpu, cpu_mean
+                    ),
+                });
+            }
+        }
+
+        // Guarda la muestra actual para futuras comparaciones
+        record.cpu_samples.push_back(*cpu);
+        record.mem_samples.push_back(*mem_mb);
+        if record.cpu_samples.len() > MAX_HISTORY_SAMPLES {
+            record.cpu_samples.pop_front();
+        }
+        if record.mem_samples.len() > MAX_HISTORY_SAMPLES {
+            record.mem_samples.pop_front();
+        }
+    }
+
+    alerts.sort_by(|a, b| b.current_value.partial_cmp(&a.current_value).unwrap());
+    alerts
+}
+
+#[derive(Clone, serde::Serialize)]
+struct DiskHealth {
+    name: String,
+    total_gb: f64,
+    free_gb: f64,
+    used_pct: f64,
+}
+
+#[tauri::command]
+fn get_disk_health() -> Vec<DiskHealth> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+
+    disks
+        .iter()
+        .map(|d| {
+            let total = d.total_space() as f64 / 1024.0 / 1024.0 / 1024.0;
+            let free = d.available_space() as f64 / 1024.0 / 1024.0 / 1024.0;
+            let used_pct = if total > 0.0 { (total - free) / total * 100.0 } else { 0.0 };
+
+            DiskHealth {
+                name: d.mount_point().to_string_lossy().to_string(),
+                total_gb: total,
+                free_gb: free,
+                used_pct,
+            }
+        })
+        .filter(|d| d.total_gb > 0.0)
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
             sys: Mutex::new(System::new_all()),
+            history: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             greet,
@@ -548,7 +795,11 @@ pub fn run() {
             get_startup_programs,
             toggle_startup_program,
             get_temp_categories,
-            clean_temp_category
+            clean_temp_category,
+            get_drives,
+            get_folder_sizes,
+            get_anomalies,
+            get_disk_health
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

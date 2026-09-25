@@ -49,8 +49,31 @@ interface CleanResult {
   skipped_count: number;
 }
 
+interface FolderEntry {
+  name: string;
+  path: string;
+  size_mb: number;
+  is_dir: boolean;
+}
+
+interface AnomalyAlert {
+  process_name: string;
+  metric: string;
+  current_value: number;
+  baseline_avg: number;
+  severity: string;
+  message: string;
+}
+
+interface DiskHealth {
+  name: string;
+  total_gb: number;
+  free_gb: number;
+  used_pct: number;
+}
+
 type SortKey = "memory_mb" | "cpu_usage" | "name";
-type View = "dashboard" | "processes" | "startup" | "temp";
+type View = "dashboard" | "processes" | "startup" | "temp" | "disk" | "anomalies" | "health";
 
 function Gauge({ label, value, max, unit, displayValue }: { label: string; value: number; max: number; unit: string; displayValue: string }) {
   const pct = Math.min(100, (value / max) * 100);
@@ -75,11 +98,19 @@ function Gauge({ label, value, max, unit, displayValue }: { label: string; value
 }
 
 const NAV_ITEMS: { id: View; label: string }[] = [
+  { id: "health", label: "Salud del sistema" },
   { id: "dashboard", label: "Panel general" },
   { id: "processes", label: "Procesos" },
   { id: "startup", label: "Inicio de Windows" },
   { id: "temp", label: "Archivos temporales" },
+  { id: "disk", label: "Espacio en disco" },
+  { id: "anomalies", label: "Anomalías" },
 ];
+
+function formatSize(mb: number): string {
+  if (mb >= 1024) return (mb / 1024).toFixed(1) + " GB";
+  return mb + " MB";
+}
 
 function App() {
   const [view, setView] = useState<View>("dashboard");
@@ -100,12 +131,24 @@ function App() {
   const [scanningTemp, setScanningTemp] = useState(false);
   const [cleaningId, setCleaningId] = useState<string | null>(null);
 
+  const [drives, setDrives] = useState<string[]>([]);
+  const [diskHistory, setDiskHistory] = useState<string[]>([]);
+  const [diskEntries, setDiskEntries] = useState<FolderEntry[]>([]);
+  const [loadingDisk, setLoadingDisk] = useState(false);
+
+  const [anomalies, setAnomalies] = useState<AnomalyAlert[]>([]);
+  const [diskHealth, setDiskHealth] = useState<DiskHealth[]>([]);
+
   useEffect(() => {
     const fetchData = async () => {
       const info = await invoke<SystemInfo>("get_system_info");
       setSysInfo(info);
       const procs = await invoke<ProcessInfo[]>("get_processes");
       setProcesses(procs);
+      const anom = await invoke<AnomalyAlert[]>("get_anomalies");
+      setAnomalies(anom);
+      const disks = await invoke<DiskHealth[]>("get_disk_health");
+      setDiskHealth(disks);
     };
 
     fetchData();
@@ -115,6 +158,10 @@ function App() {
 
   useEffect(() => {
     invoke<StartupProgram[]>("get_startup_programs").then(setStartupPrograms);
+  }, []);
+
+  useEffect(() => {
+    invoke<string[]>("get_drives").then(setDrives);
   }, []);
 
   useEffect(() => {
@@ -132,6 +179,41 @@ function App() {
     });
     return copy;
   }, [processes, sortKey, sortDir]);
+
+  const healthScore = useMemo(() => {
+    const ramPct = sysInfo ? (sysInfo.used_ram_mb / sysInfo.total_ram_mb) * 100 : 0;
+    const cpuPct = sysInfo?.cpu_usage ?? 0;
+    const worstDiskPct = diskHealth.length > 0 ? Math.max(...diskHealth.map((d) => d.used_pct)) : 0;
+    const enabledStartupCount = startupPrograms.filter((p) => p.enabled).length;
+
+    const ramScore = Math.max(0, 100 - ramPct);
+    const cpuScore = Math.max(0, 100 - cpuPct);
+    const diskScore = Math.max(0, 100 - worstDiskPct);
+    const anomalyScore = Math.max(0, 100 - anomalies.length * 15);
+    const startupScore = Math.max(0, 100 - Math.max(0, enabledStartupCount - 8) * 10);
+
+    const overall =
+      ramScore * 0.25 + cpuScore * 0.2 + diskScore * 0.2 + anomalyScore * 0.2 + startupScore * 0.15;
+
+    let grade = "Crítico";
+    let gradeLevel = "critical";
+    if (overall >= 85) { grade = "Excelente"; gradeLevel = "normal"; }
+    else if (overall >= 65) { grade = "Bueno"; gradeLevel = "normal"; }
+    else if (overall >= 45) { grade = "Regular"; gradeLevel = "warning"; }
+
+    return {
+      overall: Math.round(overall),
+      grade,
+      gradeLevel,
+      breakdown: [
+        { label: "Memoria RAM", score: Math.round(ramScore), detail: `${ramPct.toFixed(0)}% en uso` },
+        { label: "Procesador", score: Math.round(cpuScore), detail: `${cpuPct.toFixed(0)}% en uso` },
+        { label: "Espacio en disco", score: Math.round(diskScore), detail: diskHealth.length > 0 ? `${worstDiskPct.toFixed(0)}% ocupado (peor unidad)` : "sin datos" },
+        { label: "Anomalías activas", score: Math.round(anomalyScore), detail: `${anomalies.length} detectadas` },
+        { label: "Programas de inicio", score: Math.round(startupScore), detail: `${enabledStartupCount} activos` },
+      ],
+    };
+  }, [sysInfo, diskHealth, anomalies, startupPrograms]);
 
   function handleSort(key: SortKey) {
     if (key === sortKey) {
@@ -241,9 +323,61 @@ function App() {
     }
   }
 
+  async function loadDiskPath(path: string, pushHistory = true) {
+    if (diskCache[path]) {
+      setDiskEntries(diskCache[path]);
+      if (pushHistory) setDiskHistory((prev) => [...prev, path]);
+      return;
+    }
+
+    setLoadingDisk(true);
+    try {
+      const entries = await invoke<FolderEntry[]>("get_folder_sizes", { path });
+      setDiskCache((prev) => ({ ...prev, [path]: entries }));
+      setDiskEntries(entries);
+      if (pushHistory) {
+        setDiskHistory((prev) => [...prev, path]);
+      }
+    } catch (err) {
+      setFeedback({ type: "error", text: String(err) });
+    } finally {
+      setLoadingDisk(false);
+    }
+  }
+
+  function handleSelectDrive(drive: string) {
+    setDiskHistory([]);
+    loadDiskPath(drive);
+  }
+
+  function handleEnterFolder(entry: FolderEntry) {
+    if (!entry.is_dir) return;
+    loadDiskPath(entry.path);
+  }
+
+  function handleDiskBack() {
+    if (diskHistory.length === 0) return;
+
+    if (diskHistory.length === 1) {
+      // Vuelve a la selección de unidad
+      setDiskHistory([]);
+      setDiskEntries([]);
+      return;
+    }
+
+  const newHistory = diskHistory.slice(0, -1);
+  const parent = newHistory[newHistory.length - 1];
+  setDiskHistory(newHistory);
+  loadDiskPath(parent, false);
+}
+
+  const currentDiskPath = diskHistory[diskHistory.length - 1] ?? "";
+  const maxDiskEntrySize = Math.max(1, ...diskEntries.map((e) => e.size_mb));
+
   const ramUsedGb = sysInfo ? (sysInfo.used_ram_mb / 1024).toFixed(1) : "—";
   const ramTotalGb = sysInfo ? (sysInfo.total_ram_mb / 1024).toFixed(1) : "—";
-
+  const [diskCache, setDiskCache] = useState<Record<string, FolderEntry[]>>({});
+  
   return (
     <div className="app-layout">
       <aside className="sidebar">
@@ -259,6 +393,9 @@ function App() {
               onClick={() => setView(item.id)}
             >
               {item.label}
+              {item.id === "anomalies" && anomalies.length > 0 && (
+                <span className="nav-badge">{anomalies.length}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -454,6 +591,170 @@ function App() {
                   </tbody>
                 </table>
               )}
+            </section>
+          </>
+        )}
+
+        {view === "disk" && (
+          <>
+            <h2 className="view-title">Espacio en disco</h2>
+            <section className="panel panel--table">
+              {diskHistory.length === 0 ? (
+                <>
+                  <div className="panel-head">
+                    <h2>Selecciona una unidad</h2>
+                  </div>
+                  <div className="drive-list">
+                    {drives.map((d) => (
+                      <button
+                        key={d}
+                        className="drive-button"
+                        onClick={() => handleSelectDrive(d)}
+                        disabled={loadingDisk}
+                      >
+                        {d}
+                      </button>
+                    ))}
+                  </div>
+                  {loadingDisk && (
+                    <p className="panel-subtext scanning-hint">
+                      Escaneando unidad completa — en discos grandes (C:\) puede tardar varios minutos, la app sigue respondiendo mientras tanto.
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="panel-head">
+                    <div className="breadcrumb">
+                      <button
+                        className="btn-scan"
+                        onClick={handleDiskBack}
+                        disabled={loadingDisk}
+                      >
+                        ← Atrás
+                      </button>
+                      <span className="breadcrumb-path">{currentDiskPath}</span>
+                    </div>
+                    <span className="panel-subtext">
+                      {loadingDisk ? "Calculando tamaños..." : `${diskEntries.length} elementos`}
+                    </span>
+                  </div>
+
+                  {loadingDisk ? (
+                    <div className="scanning-block">
+                      <span className="spinner" />
+                      <span>Calculando tamaños de carpetas, un momento...</span>
+                    </div>
+                  ) : (
+                    <table className="process-table">
+                      <thead>
+                        <tr>
+                          <th className="col-name">Nombre</th>
+                          <th className="col-num">Tamaño</th>
+                          <th className="col-bar"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {diskEntries.map((entry) => (
+                          <tr
+                            key={entry.path}
+                            className={entry.is_dir ? "row-clickable" : ""}
+                            onClick={() => handleEnterFolder(entry)}
+                          >
+                            <td className="col-name">
+                              {entry.is_dir ? "📁 " : "📄 "}
+                              {entry.name}
+                            </td>
+                            <td className="col-num">{formatSize(entry.size_mb)}</td>
+                            <td className="col-bar">
+                              <div className="size-bar-track">
+                                <div
+                                  className="size-bar-fill"
+                                  style={{ width: `${(entry.size_mb / maxDiskEntrySize) * 100}%` }}
+                                />
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </>
+              )}
+            </section>
+          </>
+        )}
+
+        {view === "anomalies" && (
+          <>
+            <h2 className="view-title">Anomalías detectadas</h2>
+            <section className="panel panel--table">
+              <div className="panel-head">
+                <h2>Comportamiento fuera de lo normal</h2>
+                <span className="panel-subtext">
+                  Comparado contra el historial de cada proceso (últimos ~60s)
+                </span>
+              </div>
+
+              {anomalies.length === 0 ? (
+                <p className="panel-subtext">
+                  Sin anomalías por ahora. La app necesita ~10 segundos de historial por proceso antes de poder detectar patrones inusuales.
+                </p>
+              ) : (
+                <div className="anomaly-list">
+                  {anomalies.map((a, i) => (
+                    <div key={i} className={`anomaly-card anomaly-card--${a.severity}`}>
+                      <div className="anomaly-head">
+                        <span className="anomaly-name">{a.process_name}</span>
+                        <span className={`anomaly-severity anomaly-severity--${a.severity}`}>
+                          {a.severity === "critical" ? "crítico" : "atención"}
+                        </span>
+                      </div>
+                      <p className="anomaly-message">{a.message}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </>
+        )}
+
+        {view === "health" && (
+          <>
+            <h2 className="view-title">Salud del sistema</h2>
+            <section className="panel panel--score">
+              <div className="score-main">
+                <div className={`score-circle score-circle--${healthScore.gradeLevel}`}>
+                  <span className="score-number">{healthScore.overall}</span>
+                  <span className="score-max">/100</span>
+                </div>
+                <div>
+                  <span className={`score-grade score-grade--${healthScore.gradeLevel}`}>{healthScore.grade}</span>
+                  <p className="panel-subtext">Basado en 5 factores, actualizado en vivo</p>
+                </div>
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-head">
+                <h2>Desglose</h2>
+              </div>
+              <div className="breakdown-list">
+                {healthScore.breakdown.map((item) => {
+                  const level = item.score < 45 ? "critical" : item.score < 65 ? "warning" : "normal";
+                  return (
+                    <div key={item.label} className="breakdown-row">
+                      <div className="breakdown-labels">
+                        <span>{item.label}</span>
+                        <span className="panel-subtext">{item.detail}</span>
+                      </div>
+                      <div className="gauge-track breakdown-track">
+                        <div className={`gauge-fill gauge-fill--${level}`} style={{ width: `${item.score}%` }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </section>
           </>
         )}
