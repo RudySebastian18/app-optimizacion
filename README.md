@@ -31,6 +31,10 @@ npm run tauri build
 
 El instalador se genera en \src-tauri/target/release/bundle/msi/\.
 
+## Aclaracion
+
+El instalador puede disparar una alerta de Windows Defender/SmartScreen por no estar firmado digitalmente,así quien lo descargue no se asuste pensando que algo está mal, y entiende que es esperado para software independiente sin certificado de firma.
+
 ## Descarga
 
 Instalador disponible en la sección [Releases](../../releases) de este repositorio.
